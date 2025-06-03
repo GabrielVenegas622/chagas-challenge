@@ -2,7 +2,9 @@ import os
 import random
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from helper_code import load_text
+from collections import Counter
+from helper_code import load_text, load_label
+from imblearn.under_sampling import RandomUnderSampler
 
 # === Configuration ===
 dataset_dirs = {
@@ -10,7 +12,7 @@ dataset_dirs = {
     "ptbxl": "ptbxl_output",
 }
 
-output_base = Path("dataset")  # Preserving original dataset/train and dataset/val structure
+output_base = Path("dataset")
 train_dir = output_base / "train"
 val_dir = output_base / "val"
 holdout_dir = Path("holdout_data")
@@ -24,14 +26,13 @@ def symlink_single_record(record, dest_dir, remove_label=False):
     for ext in ['.hea', '.dat', '.txt']:
         src_file = record.with_suffix(ext)
         if src_file.exists():
-            dst_file = dest_dir / src_file.name  # Keep original filename (with _hr if present)
+            dst_file = dest_dir / src_file.name
             try:
                 if not dst_file.exists():
                     os.symlink(src_file.resolve(), dst_file)
             except FileExistsError:
                 pass
 
-            # Optional: remove label from .txt file (if your pipeline generates those)
             if remove_label and ext == '.txt':
                 text = load_text(src_file)
                 text['label'] = None
@@ -56,11 +57,48 @@ def symlink_records_parallel(records, dest_dir, remove_label=False, label=""):
 
     print(f"[{label}] Done.\n")
 
+# === Undersample combined train set ===
+def undersample_records(records):
+    X, y = [], []
+
+    for record in records:
+        try:
+            label = load_label(str(record))  # Convert Path to string
+            print(f"{record.name} → {label}")
+            if label is not None:
+                X.append(record)
+                y.append(label)
+        except Exception as e:
+            print(f"Skipping {record.name}: {e}")
+
+    if not X:
+        print("No labels found for undersampling.")
+        return records
+
+    print("Original class distribution:", Counter(y))
+
+    if len(set(y)) < 2:
+        print("Only one class found — skipping undersampling.")
+        return X
+
+    X_indices = list(range(len(X)))
+    rus = RandomUnderSampler(random_state=42)
+    X_resampled, y_resampled = rus.fit_resample([[i] for i in X_indices], y)
+
+    selected_indices = [i[0] for i in X_resampled]
+    undersampled_records = [X[i] for i in selected_indices]
+
+    print("Resampled class distribution:", Counter(y_resampled))
+    print(f"Undersampled: from {len(records)} to {len(undersampled_records)} records.")
+    return undersampled_records
+
 # === Main dataset split and processing ===
+all_train_records = []
+all_val_records = []
+all_test_records = []
+
 for dataset_name, dataset_path in dataset_dirs.items():
     dataset_path = Path(dataset_path)
-    
-    # Get all .hea files, strip extension to keep base name with _hr if present
     record_list = sorted([f.with_suffix('') for f in dataset_path.glob("*.hea")])
     random.shuffle(record_list)
 
@@ -73,8 +111,12 @@ for dataset_name, dataset_path in dataset_dirs.items():
     test_records = record_list[n_train + n_val:]
 
     print(f"\nProcessing dataset: {dataset_name}")
-    symlink_records_parallel(train_records, train_dir, label=f"{dataset_name} - train")
-    symlink_records_parallel(val_records, val_dir, label=f"{dataset_name} - val")
+    all_train_records += train_records
+    all_val_records += val_records
+    all_test_records += test_records
 
-    if dataset_name in ["samitrop", "ptbxl"]:
-        symlink_records_parallel(test_records, holdout_dir, remove_label=True, label=f"{dataset_name} - holdout")
+# 🔁 Perform undersampling *after* merging both datasets
+train_records_sampled = undersample_records(all_train_records)
+symlink_records_parallel(train_records_sampled, train_dir, label="combined - train (undersampled)")
+symlink_records_parallel(all_val_records, val_dir, label="combined - val")
+symlink_records_parallel(all_test_records, holdout_dir, remove_label=True, label="combined - holdout")
