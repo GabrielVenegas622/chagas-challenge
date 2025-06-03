@@ -42,23 +42,31 @@ def train_model(data_folder, model_folder, verbose):
     if verbose:
         print('Extracting features and labels from the data...')
 
-    features = np.zeros((num_records, 6), dtype=np.float64)
-    labels = np.zeros(num_records, dtype=bool)
-
-    # Iterate over the records.
+    # Iterate over the records to extract the features and labels.
+    features = list()
+    labels = list()
     for i in range(num_records):
         if verbose:
             width = len(str(num_records))
             print(f'- {i+1:>{width}}/{num_records}: {records[i]}...')
 
         record = os.path.join(data_folder, records[i])
-        features[i] = extract_features(record)
-        labels[i] = load_label(record)
+        age, sex, source, signal_mean, signal_std = extract_features(record)
+        label = load_label(record)
 
-    # Train the models.
+        # Store the features and labels, but skip most of the CODE-15% data because there are many records, and the labels are weak.
+        # You can treat the different data sources however you might like in your training code.
+        if source != 'CODE-15%' or (i % 10) == 0:
+            features.append(np.concatenate((age, sex, signal_mean, signal_std)))
+            labels.append(label)
+
+    features = np.asarray(features, dtype=np.float32)
+    labels = np.asarray(labels, dtype=bool)
+
+    # Train the models on the features.
     if verbose:
         print('Training the model on the data...')
-    
+
     # This very simple model trains a random forest model with very simple features.
 
     # Define the parameters for the random forest classifier and regressor.
@@ -94,8 +102,8 @@ def run_model(record, model, verbose):
     model = model['model']
 
     # Extract the features.
-    features = extract_features(record)
-    features = features.reshape(1, -1)
+    age, sex, source, signal_mean, signal_std = extract_features(record)
+    features = np.concatenate((age, sex, signal_mean, signal_std)).reshape(1, -1)
 
     # Get the model outputs.
     binary_output = model.predict(features)[0]
@@ -112,34 +120,51 @@ def run_model(record, model, verbose):
 # Extract your features.
 def extract_features(record):
     header = load_header(record)
+
+    # Extract the age from the record.
     age = get_age(header)
+    age = np.array([age])
+
+    # Extract the sex from the record and represent it as a one-hot encoded vector.
     sex = get_sex(header)
-    
-    one_hot_encoding_sex = np.zeros(3, dtype=bool)
-    if sex == 'Female':
-        one_hot_encoding_sex[0] = 1
-    elif sex == 'Male':
-        one_hot_encoding_sex[1] = 1
+    sex_one_hot_encoding = np.zeros(3, dtype=bool)
+    if sex.casefold().startswith('f'):
+        sex_one_hot_encoding[0] = 1
+    elif sex.casefold().startswith('m'):
+        sex_one_hot_encoding[1] = 1
     else:
-        one_hot_encoding_sex[2] = 1
+        sex_one_hot_encoding[2] = 1
 
+    # Extract the source from the record (but do not use it as a feature).
+    source = get_source(header)
+
+    # Load the signal data and fields. Try fields.keys() to see the fields, e.g., fields['fs'] is the sampling frequency.
     signal, fields = load_signals(record)
+    channels = fields['sig_name']
 
-    # TO-DO: Update to compute per-lead features. Check lead order and update and use functions for reordering leads as needed.
+    # Reorder the channels in case they are in a different order in the signal data.
+    reference_channels = ['I', 'II', 'III', 'AVR', 'AVL', 'AVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
+    num_channels = len(reference_channels)
+    signal = reorder_signal(signal, channels, reference_channels)
 
-    num_finite_samples = np.size(np.isfinite(signal))
-    if num_finite_samples > 0:
-        signal_mean = np.nanmean(signal)
-    else:
-        signal_mean = 0.0
-    if num_finite_samples > 1:
-        signal_std = np.nanstd(signal)
-    else:
-        signal_std = 0.0
+    # Compute two per-channel features as examples.
+    signal_mean = np.zeros(num_channels)
+    signal_std = np.zeros(num_channels)
 
-    features = np.concatenate(([age], one_hot_encoding_sex, [signal_mean, signal_std]))
+    for i in range(num_channels):
+        num_finite_samples = np.sum(np.isfinite(signal[:, i]))
+        if num_finite_samples > 0:
+            signal_mean[i] = np.nanmean(signal)
+        else:
+            signal_mean = 0.0
+        if num_finite_samples > 1:
+            signal_std[i] = np.nanstd(signal)
+        else:
+            signal_std = 0.0
 
-    return np.asarray(features, dtype=np.float32)
+    # Return the features.
+
+    return age, sex_one_hot_encoding, source, signal_mean, signal_std
 
 # Save your trained model.
 def save_model(model_folder, model):
