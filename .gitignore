@@ -1,5 +1,5 @@
 # Ignore virtual environment directory
-.venv/
+venv/
 
 #Ignore dataset downloads and outputs
 ptbxl_input/
@@ -18,3 +18,5 @@ holdout_data/
 val_outputs/
 
 holdout_outputs/
+
+HearHeart/

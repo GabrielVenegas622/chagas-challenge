@@ -16,6 +16,13 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 import sys
 
 from helper_code import *
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+from HearHeart.base_model import AudioClassifier
+
 
 ################################################################################
 #
@@ -26,90 +33,97 @@ from helper_code import *
 # Train your models. This function is *required*. You should edit this function to add your code, but do *not* change the arguments
 # of this function. If you do not train one of the models, then you can return None for the model.
 
+
+FIXED_LENGTH = 3000  # pad or crop ECG signals to this length
+
+class ECGDataset(Dataset):
+    def __init__(self, folder):
+        self.folder = folder
+        self.records = find_records(folder)
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        record = os.path.join(self.folder, self.records[idx])
+        signal, _ = load_signals(record)
+        signal = signal.T  # [12, L]
+        signal = signal[:12, :]  # only 12 leads
+
+        # Pad or crop to fixed length
+        L = signal.shape[1]
+        if L < FIXED_LENGTH:
+            pad_width = FIXED_LENGTH - L
+            signal = np.pad(signal, ((0, 0), (0, pad_width)), mode='constant')
+        else:
+            signal = signal[:, :FIXED_LENGTH]
+
+        signal = torch.tensor(signal, dtype=torch.float32).unsqueeze(0)  # [1, 12, L]
+        label = load_label(record)
+        label = torch.tensor(label, dtype=torch.float32)
+        return signal, label
+    
+
 # Train your model.
 def train_model(data_folder, model_folder, verbose):
-    # Find the data files.
-    if verbose:
-        print('Finding the Challenge data...')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    records = find_records(data_folder)
-    num_records = len(records)
+    train_dataset = ECGDataset(os.path.join(data_folder, 'train'))
+    val_dataset = ECGDataset(os.path.join(data_folder, 'val'))
 
-    if num_records == 0:
-        raise FileNotFoundError('No data were provided.')
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
-    # Extract the features and labels from the data.
-    if verbose:
-        print('Extracting features and labels from the data...')
+    model = AudioClassifier().to(device)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-    # Iterate over the records to extract the features and labels.
-    features = list()
-    labels = list()
-    for i in range(num_records):
+    for epoch in range(10):
+        model.train()
+        total_loss = 0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            out = model(x).squeeze(1)
+            loss = criterion(torch.sigmoid(out), y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
         if verbose:
-            width = len(str(num_records))
-            print(f'- {i+1:>{width}}/{num_records}: {records[i]}...')
+            print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
 
-        record = os.path.join(data_folder, records[i])
-        age, sex, source, signal_mean, signal_std = extract_features(record)
-        label = load_label(record)
-
-        # Store the features and labels, but skip most of the CODE-15% data because there are many records, and the labels are weak.
-        # You can treat the different data sources however you might like in your training code.
-        if source != 'CODE-15%' or (i % 10) == 0:
-            features.append(np.concatenate((age, sex, signal_mean, signal_std)))
-            labels.append(label)
-
-    features = np.asarray(features, dtype=np.float32)
-    labels = np.asarray(labels, dtype=bool)
-
-    # Train the models on the features.
-    if verbose:
-        print('Training the model on the data...')
-
-    # This very simple model trains a random forest model with very simple features.
-
-    # Define the parameters for the random forest classifier and regressor.
-    n_estimators = 12  # Number of trees in the forest.
-    max_leaf_nodes = 34  # Maximum number of leaf nodes in each tree.
-    random_state = 56  # Random state; set for reproducibility.
-
-    # Fit the model.
-    model = RandomForestClassifier(
-        n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
-
-    # Create a folder for the model if it does not already exist.
     os.makedirs(model_folder, exist_ok=True)
-
-    # Save the model.
-    save_model(model_folder, model)
-
-    if verbose:
-        print('Done.')
-        print()
+    torch.save(model.state_dict(), os.path.join(model_folder, 'model.pt'))
 
 # Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
 # arguments of this function. If you do not train one of the models, then you can return None for the model.
 def load_model(model_folder, verbose):
-    model_filename = os.path.join(model_folder, 'model.sav')
-    model = joblib.load(model_filename)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = AudioClassifier().to(device)
+    model.load_state_dict(torch.load(os.path.join(model_folder, 'model.pt'), map_location=device))
+    model.eval()
     return model
 
 # Run your trained model. This function is *required*. You should edit this function to add your code, but do *not* change the
 # arguments of this function.
 def run_model(record, model, verbose):
-    # Load the model.
-    model = model['model']
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    signal, _ = load_signals(record)
+    signal = signal.T[:12, :]
+    L = signal.shape[1]
+    if L < FIXED_LENGTH:
+        pad_width = FIXED_LENGTH - L
+        signal = np.pad(signal, ((0, 0), (0, pad_width)), mode='constant')
+    else:
+        signal = signal[:, :FIXED_LENGTH]
+    signal = torch.tensor(signal, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, 12, L]
 
-    # Extract the features.
-    age, sex, source, signal_mean, signal_std = extract_features(record)
-    features = np.concatenate((age, sex, signal_mean, signal_std)).reshape(1, -1)
+    with torch.no_grad():
+        output = model(signal)
+        prob = torch.sigmoid(output).item()
+        pred = int(prob >= 0.5)
 
-    # Get the model outputs.
-    binary_output = model.predict(features)[0]
-    probability_output = model.predict_proba(features)[0][1]
-
-    return binary_output, probability_output
+    return pred, prob
 
 ################################################################################
 #
